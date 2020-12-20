@@ -1,0 +1,49 @@
+#!/bin/sh -eu
+
+cmd="$(basename "$0" .sh)"
+
+# If you want to slightly speed things up, change this to something like:
+#srcdir="$HOME/src/self-build-tools"
+# or wherever this is checked out
+srcdir="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/src"
+
+var_ns='example.org/private/selfbuild/golib'
+
+srcfile="$cmd.go"
+exedir="$HOME/go/bin"
+exefile="$exedir/$cmd"
+
+[ -d "$exedir" ] || mkdir -p "$exedir"
+
+if [ -e "$exefile" ] && \
+   [ "$exefile" -nt "$srcdir/$srcfile" ] && \
+   [ "$exefile" -nt "$srcdir/go.sum" ]; then true; else
+  printf >&2 '%s: compiling %s\n' "$cmd" "${cmd}.go"
+  here="$(pwd)"
+  cd "$srcdir"
+
+  r_branch="$(git rev-parse --abbrev-ref HEAD --quiet)"
+  r_date="$(git show --format='%ct' HEAD --quiet)"
+  r_commit_long="$(git show --format='%H' HEAD --quiet)"
+  r_describe="$(git describe --always --dirty --tags)"
+  t_tmp="$(git log -1 '--pretty=tformat:%at %H' -- "$srcfile")"
+  t_date="${t_tmp% *}"
+  t_commit_long="${t_tmp#* }"
+
+  ldflags=''
+  ldflags="$ldflags -X $var_ns.CompileTimeEpochSecs=$(date +%s)"
+  ldflags="$ldflags -X $var_ns.GitVersion=$r_describe"
+  ldflags="$ldflags -X $var_ns.GitCommit=$r_commit_long"
+  ldflags="$ldflags -X $var_ns.GitDate=$r_date"
+  ldflags="$ldflags -X $var_ns.GitBranch=$r_branch"
+  ldflags="$ldflags -X $var_ns.ToolDate=$t_date"
+  ldflags="$ldflags -X $var_ns.ToolCommit=$t_commit_long"
+
+  go build -v -ldflags "$ldflags" -o "$exefile" "$srcfile"
+  cd "$here"
+fi
+
+exec "$exefile" "$@"
+exit 70
+
+# vim: set ft=sh sw=2 et :
