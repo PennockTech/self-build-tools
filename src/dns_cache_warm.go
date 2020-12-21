@@ -29,6 +29,7 @@ import (
 )
 
 const CONCURRENT = 20
+const EST_MAX_QUERIES = 2000 // we make a bunch of channels of this size
 const CONFIG_FILE_DEFAULT = "~/etc/dns-cache-warm.conf"
 const ENVVAR_EXTRA_RESOLVE = "DNS_CACHE_EXTRA_RESOLVE"
 const EDNS0_SIZE = 4096
@@ -118,7 +119,11 @@ func startResolver(resolverHosts []string) (rw *ResolveWrapper, err error) {
 			prRChans := make([]<-chan Item, resolverCount)
 			prWChans := make([]chan<- Item, resolverCount)
 			for j := 0; j < resolverCount; j++ {
-				n := make(chan Item)
+				// We buffer this so that adding new queries isn't locked on
+				// the slowest of the resolvers we talk to, thus inadvertently
+				// aligning total duration to the sum of the slowest for each
+				// name, rather than the max of the slowest resolver.
+				n := make(chan Item, EST_MAX_QUERIES)
 				prWChans[j] = n
 				prRChans[j] = n
 				go oneResolverPerTarget(j+resolverCount*i, prRChans[j], rw.wg, rw.hosts[j], &rw.stats)
@@ -567,7 +572,7 @@ func (rw *ResolveWrapper) PrintSummary() {
 		})
 		sort.Strings(names) // do I have a convenient IPsort/HOSTsort around?
 		for _, name := range names {
-			log.Printf(" [%7s] %s", durations[name].Round(time.Millisecond), name)
+			log.Printf(" [%7.3fs] %s", durations[name].Seconds(), name)
 		}
 	}
 }
