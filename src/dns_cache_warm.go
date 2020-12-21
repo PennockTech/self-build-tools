@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,6 +88,7 @@ type Stats struct {
 	unhandledCount     uint32
 	noresultsCount     uint32
 	startTime          time.Time
+	durations          sync.Map
 }
 
 func startResolver(resolverHosts []string) (rw *ResolveWrapper, err error) {
@@ -151,6 +153,7 @@ func (rw *ResolveWrapper) Wait() {
 
 func oneResolverStdlib(index int, ch <-chan Item, wg *sync.WaitGroup, stats *Stats) {
 	defer wg.Done()
+	start := time.Now()
 	res := &net.Resolver{}
 	for {
 		item, ok := <-ch
@@ -159,6 +162,7 @@ func oneResolverStdlib(index int, ch <-chan Item, wg *sync.WaitGroup, stats *Sta
 		}
 		resolveStdlib(index, res, item, stats)
 	}
+	stats.durations.Store("stdlib", time.Now().Sub(start))
 }
 
 func adminResolver(index int, inbound <-chan Item, chList []chan<- Item, wg *sync.WaitGroup) {
@@ -181,6 +185,7 @@ func adminResolver(index int, inbound <-chan Item, chList []chan<- Item, wg *syn
 
 func oneResolverPerTarget(resIndex int, ch <-chan Item, wg *sync.WaitGroup, resolverName string, stats *Stats) {
 	defer wg.Done()
+	start := time.Now()
 	rc := &RecClient{
 		client: dns.Client{
 			Timeout: DNS_TIMEOUT,
@@ -195,6 +200,7 @@ func oneResolverPerTarget(resIndex int, ch <-chan Item, wg *sync.WaitGroup, reso
 		}
 		resolvePerTarget(resIndex, rc, item, stats)
 	}
+	stats.durations.Store(resolverName, time.Now().Sub(start))
 }
 
 func resolveStdlib(index int, res *net.Resolver, item Item, stats *Stats) {
@@ -545,11 +551,31 @@ func (rw *ResolveWrapper) PrintSummary() {
 	log.Printf("Summary: %v for %d requests %s, taking %d queries%s",
 		duration, requested, targetRepr,
 		queries, statsRepr)
+
+	// We actually time always, it's simpler than making the time conditional
+	// and the overhead is low.  So really it's "report that we timed".
+	if opts.TimeResolvers {
+		// it's servers else 1, Go has no ternary, just add 1
+		names := make([]string, 0, servers+1)
+		durations := make(map[string]time.Duration, servers+1)
+		rw.stats.durations.Range(func(i, v interface{}) bool {
+			n := i.(string)
+			d := v.(time.Duration)
+			names = append(names, n)
+			durations[n] = d
+			return true
+		})
+		sort.Strings(names) // do I have a convenient IPsort/HOSTsort around?
+		for _, name := range names {
+			log.Printf(" [%7s] %s", durations[name].Round(time.Millisecond), name)
+		}
+	}
 }
 
 var opts struct {
-	ProgressOnly bool
-	ConfigFile   string
+	ProgressOnly  bool
+	TimeResolvers bool
+	ConfigFile    string
 }
 
 type progressT struct {
@@ -571,6 +597,7 @@ func registerFlags() {
 
 	flag.BoolVar(&opts.ProgressOnly, "progress", false, "show progress & summary only")
 	flag.BoolVar(&opts.ProgressOnly, "p", false, "show progress & summary only")
+	flag.BoolVar(&opts.TimeResolvers, "time-resolvers", false, "show summary times per resolver")
 	flag.StringVar(&opts.ConfigFile, "config", defaultConfig, "file with DNS entries to resolve")
 }
 
