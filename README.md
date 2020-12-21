@@ -121,6 +121,7 @@ file, there exists a symlink in the bin directory.
 
 I use a wrapper `dns_cache_warm_home` which puts some `.home.arpa` hostnames
 into the `DNS_CACHE_EXTRA_RESOLVE` environment variable and invokes
-`dns_cache_warm` with `--progress` and the IP addresses of the DNS resolvers
-on my home LAN.  The extra hostnames are not in the committed file because
-that is shared beyond my home network.
+`dns_cache_warm` with `--progress --time-resolvers` and the IP addresses of
+the DNS resolvers on my home LAN.
+The extra hostnames are not in the committed file because that is shared
+beyond my home network.
