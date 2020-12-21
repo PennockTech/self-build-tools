@@ -592,7 +592,7 @@ func main() {
 	golib.FastFlags()
 	log.SetFlags(0)
 
-	resolve, err := startResolver(os.Args[1:])
+	resolve, err := startResolver(flag.Args())
 	if err != nil {
 		log.Fatal("startResolver", err)
 	}
