@@ -2,6 +2,11 @@
 
 cmd="$(basename "$0" .sh)"
 
+if [ "$cmd" = "go_compile_cache" ]; then
+  printf >&2 '%s: %s\n' "$cmd" 'this is a wrapper shim, should be invoked via symlink'
+  exit 64  # EX_USAGE
+fi
+
 # If you want to slightly speed things up, change this to something like:
 #srcdir="$HOME/src/self-build-tools"
 # or wherever this is checked out
@@ -17,27 +22,33 @@ exefile="$exedir/$cmd"
 
 if [ -e "$exefile" ] && \
    [ "$exefile" -nt "$srcdir/$srcfile" ] && \
-   [ "$exefile" -nt "$srcdir/go.sum" ]; then true; else
+   [ "$exefile" -nt "$srcdir/go.sum" ] && \
+   [ "${GO_FORCE_COMPILE:-}" = "" ]; then true; else
   printf >&2 '%s: compiling %s\n' "$cmd" "${cmd}.go"
   here="$(pwd)"
   cd "$srcdir"
 
-  r_branch="$(git rev-parse --abbrev-ref HEAD --quiet)"
-  r_date="$(git show --format='%ct' HEAD --quiet)"
-  r_commit_long="$(git show --format='%H' HEAD --quiet)"
-  r_describe="$(git describe --always --dirty --tags)"
-  t_tmp="$(git log -1 '--pretty=tformat:%at %H' -- "$srcfile")"
-  t_date="${t_tmp% *}"
-  t_commit_long="${t_tmp#* }"
-
   ldflags=''
   ldflags="$ldflags -X $var_ns.CompileTimeEpochSecs=$(date +%s)"
-  ldflags="$ldflags -X $var_ns.GitVersion=$r_describe"
-  ldflags="$ldflags -X $var_ns.GitCommit=$r_commit_long"
-  ldflags="$ldflags -X $var_ns.GitDate=$r_date"
-  ldflags="$ldflags -X $var_ns.GitBranch=$r_branch"
-  ldflags="$ldflags -X $var_ns.ToolDate=$t_date"
-  ldflags="$ldflags -X $var_ns.ToolCommit=$t_commit_long"
+
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    r_branch="$(git rev-parse --abbrev-ref HEAD --quiet)"
+    r_date="$(git show --format='%ct' HEAD --quiet)"
+    r_commit_long="$(git show --format='%H' HEAD --quiet)"
+    r_describe="$(git describe --always --dirty --tags)"
+    t_tmp="$(git log -1 '--pretty=tformat:%at %H' -- "$srcfile")"
+    t_date="${t_tmp% *}"
+    t_commit_long="${t_tmp#* }"
+
+    ldflags="$ldflags -X $var_ns.GitVersion=$r_describe"
+    ldflags="$ldflags -X $var_ns.GitCommit=$r_commit_long"
+    ldflags="$ldflags -X $var_ns.GitDate=$r_date"
+    ldflags="$ldflags -X $var_ns.GitBranch=$r_branch"
+    ldflags="$ldflags -X $var_ns.ToolDate=$t_date"
+    ldflags="$ldflags -X $var_ns.ToolCommit=$t_commit_long"
+  elif [ -f ../.git-checkout-commit ]; then
+    ldflags="$ldflags -X $var_ns.GitCommit=$(cat ../.git-checkout-commit)"
+  fi
 
   go build -v -ldflags "$ldflags" -o "$exefile" "$srcfile"
   cd "$here"
