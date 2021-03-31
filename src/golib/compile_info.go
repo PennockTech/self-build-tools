@@ -2,6 +2,7 @@ package golib
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
 	"time"
 )
@@ -29,6 +30,7 @@ func epochTimeRender(epochSecs string) string {
 
 func ShowVersion() {
 	Stderr("compilation time: %s", epochTimeRender(CompileTimeEpochSecs))
+	Stderr("go version: %v", runtime.Version())
 	Stderr("git version: %q branch: %q", GitVersion, GitBranch)
 	Stderr("git tool commit: %s", ToolCommit)
 	Stderr("git tool commit date: %s", epochTimeRender(ToolDate))
