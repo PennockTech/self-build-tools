@@ -8,7 +8,7 @@ if [ "$cmd" = "go_compile_cache" ]; then
 fi
 
 # If you want to slightly speed things up, change this to something like:
-#srcdir="$HOME/src/self-build-tools"
+#srcdir="$HOME/src/self-build-tools/src"
 # or wherever this is checked out
 srcdir="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/src"
 

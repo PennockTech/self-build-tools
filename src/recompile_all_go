@@ -1,0 +1,63 @@
+#!/bin/sh -eu
+set -eu
+
+# If you want to slightly speed things up, change this to something like:
+#cd "$HOME/src/self-build-tools/bin"
+# or wherever this is checked out
+cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)/bin"
+
+progname="$(basename "$0" .sh)"
+die() { printf >&2 '%s: %s\n' "$progname" "$*"; exit 1; }
+
+usage() {
+  local ev="${1:-1}"
+  [ $ev -eq 0 ] || exec >&2
+  cat <<EOUSAGE
+Usage: $progname [-n]
+  -n    don't force recompile, just ask for version
+        (will compile as-needed)
+EOUSAGE
+  exit "$ev"
+}
+
+want_force=true
+#
+while getopts ':hn' arg; do
+  case "$arg" in
+    h) usage 0 ;;
+    n) want_force=false ;;
+    :) die "missing required option for -$OPTARG; see -h for help" ;;
+    \?) die "unknown option -$OPTARG; see -h for help" ;;
+    *) die "unhandled option -$arg; CODE BUG" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+find_version="$(find --version 2>&1 | head -n 2)"
+
+case "$(uname -s)" in
+  *BSD)
+    find_targets() { find . -lname \*/go_compile_cache -print ; }
+    ;;
+  *)
+    case "$find_version" in
+      *GNU\ findutils*)
+        find_targets() { find . -lname \*/go_compile_cache -print ; }
+        ;;
+      *BusyBox*)
+        find_targets() { local L; for L in $(find . -type l -print); do case $(readlink -- "$L") in */go_compile_cache) printf '%s\n' "$L";;esac; done; }
+        ;;
+      *)
+        die "unable to derive means to find right tools on this platform"
+        ;;
+    esac
+    ;;
+esac
+
+if $want_force; then
+  export GO_FORCE_COMPILE=true
+fi
+
+find_targets | while read -r cmdname; do
+  "$cmdname" -version
+done
