@@ -138,6 +138,15 @@ func main() {
 	}
 }
 
+type QueryResult struct {
+	Strings     []string
+	DurationQ   time.Duration
+	DurationAll time.Duration
+}
+
+func NewQueryResult() *QueryResult      { return &QueryResult{Strings: make([]string, 0, 5)} }
+func (qr *QueryResult) Add(item string) { qr.Strings = append(qr.Strings, item) }
+
 type Domain struct {
 	_            struct{}
 	ctx          context.Context
@@ -157,7 +166,7 @@ type Domain struct {
 	// For the per-NS stage, protect concurrent access with a mutex
 	sync.Mutex
 
-	resultsPerNS map[string][]string
+	resultsPerNS map[string]*QueryResult
 
 	// assumption: errors which are only in errors array are global, not tied
 	// to a specific NS, and all errors per NS will be stored twice, once in
@@ -237,7 +246,7 @@ func Resolver(domain, qtype string, idnaProfile *idna.Profile) (*Domain, error) 
 		ctx:          context.Background(),
 		info:         info,
 		authNS:       make([]string, 0, 14),
-		resultsPerNS: make(map[string][]string, 10),
+		resultsPerNS: make(map[string]*QueryResult, 10),
 		errorsPerNS:  make(map[string][]error, 3),
 		errors:       make([]error, 0, 20),
 	}
@@ -281,22 +290,29 @@ func (d *Domain) ShowEach(out io.Writer) {
 		}
 		sort.Strings(sortedNS) // FIXME: this should be a hostsort, not string lexicographic sort
 		for i, ns = range sortedNS {
-			if len(d.resultsPerNS[ns]) != 1 {
-				msg = fmt.Sprintf("[ERROR: got %d results]", len(d.resultsPerNS[ns]))
+			if len(d.resultsPerNS[ns].Strings) != 1 {
+				msg = fmt.Sprintf("[ERROR: got %d results]", len(d.resultsPerNS[ns].Strings))
 			} else {
 				// Ideally I'd still have access to the original response, but
 				// this mode was bolted on later and the string form is what we
 				// have.
-				msg = strings.Fields(d.resultsPerNS[ns][0])[6]
+				msg = strings.Fields(d.resultsPerNS[ns].Strings[0])[6]
 			}
 			fmt.Fprintf(out, "%-*s  %s\n", maxLen, ns, msg)
 		}
 		return
 	}
 	for _, ns := range d.authNS {
-		fmt.Fprintf(out, "; NAMESERVER: %q\n", ns)
-		for _, msg := range d.resultsPerNS[ns] {
-			fmt.Fprintf(out, "%s\n", msg)
+		qr, ok := d.resultsPerNS[ns]
+		if ok && qr == nil {
+			fmt.Fprintf(out, "; NAMESERVER: %q no results struct, internal bug?\n", ns)
+		} else if ok {
+			fmt.Fprintf(out, "; NAMESERVER: %q [%v/%v]\n", ns, qr.DurationQ.Round(time.Millisecond), qr.DurationAll.Round(time.Millisecond))
+			for _, msg := range qr.Strings {
+				fmt.Fprintf(out, "%s\n", msg)
+			}
+		} else {
+			fmt.Fprintf(out, "; NAMESERVER: %q no results map entry, internal bug?\n", ns)
 		}
 		for _, err := range d.errorsPerNS[ns] {
 			fmt.Fprintf(out, "; ERROR: %v\n", err)
@@ -319,11 +335,14 @@ func (d *Domain) findAuthNS() {
 		skipped         uint
 		primaryCapacity int
 		foundPrimary    string
+		startTime       time.Time
+		resDuration     time.Duration
 	)
 	qname := d.name
 	if opts.addedServers.WasReset {
 		qname = ""
 	}
+	startTime = time.Now()
 	for len(qname) > 0 {
 
 		// This helps with wanting to query NS type at parent, for glue
@@ -344,12 +363,13 @@ func (d *Domain) findAuthNS() {
 		//d.info = append(d.info, fmt.Sprintf("querying for NS of: %q", qname))
 		nsList, err = res.LookupNS(d.ctx, qname)
 		if err == nil {
+			resDuration = time.Since(startTime).Round(time.Millisecond)
 			suf := "s"
 			l := len(nsList)
 			if l == 1 {
 				suf = ""
 			}
-			d.info = append(d.info, fmt.Sprintf("found %d NS record%s for %q", l, suf, qname))
+			d.info = append(d.info, fmt.Sprintf("found %d NS record%s for %q in %s", l, suf, qname, resDuration))
 			break
 		}
 		// dns.NextLabel handles backslash escapes
@@ -486,12 +506,18 @@ func (d *Domain) queryOneNS(ns string) {
 		netError   net.Error
 		msg        *dns.Msg
 		i          uint
+		allStart   time.Time
+		thisStart  time.Time
 	)
+	qr := NewQueryResult()
+	allStart = time.Now()
 	for i = 0; i < opts.dnsAttempts; i++ {
 		if i > 0 {
 			time.Sleep(retryJitter((2 << (i - 1)) * time.Second))
 		}
+		thisStart = time.Now()
 		msg, _, err = client.ExchangeContext(d.ctx, &m, ns+":53")
+		qr.DurationQ = time.Since(thisStart)
 		if err != nil {
 			if i == 0 {
 				firstError = err
@@ -502,6 +528,7 @@ func (d *Domain) queryOneNS(ns string) {
 		}
 		break
 	}
+	qr.DurationAll = time.Since(allStart)
 	// skip the duration rtt
 	d.Lock()
 	defer d.Unlock()
@@ -511,17 +538,38 @@ func (d *Domain) queryOneNS(ns string) {
 		return
 	}
 	for i := range msg.Answer {
-		d.resultsPerNS[ns] = append(d.resultsPerNS[ns], msg.Answer[i].String())
+		suffix := ""
+		if h := msg.Answer[i].Header(); h != nil {
+			if h.Rrtype == dns.TypeDNSKEY {
+				dk := msg.Answer[i].(*dns.DNSKEY)
+				suffix += "\t;"
+				if dk.Flags&dns.SEP != 0 {
+					suffix += " [SEP]"
+				}
+				if dk.Flags&dns.REVOKE != 0 {
+					suffix += " [REVOKE]"
+				}
+				if dk.Flags&dns.ZONE != 0 {
+					suffix += " [ZONE]"
+				}
+				ds := dk.ToDS(dns.SHA256)
+				suffix += fmt.Sprintf(" | DS keytag=%d alg=%d digesttype=%d digest=%s",
+					ds.KeyTag, ds.Algorithm, ds.DigestType, ds.Digest)
+			}
+		}
+		qr.Add(msg.Answer[i].String() + suffix)
 	}
 	if len(msg.Answer) == 0 {
 		if msg.Truncated {
 			d.errorsPerNS[ns] = append(d.errorsPerNS[ns], fmt.Errorf("truncated: %s", ns))
 		} else {
-			d.resultsPerNS[ns] = append(d.resultsPerNS[ns], "; no results, "+dns.RcodeToString[msg.Rcode])
+			qr.Add("; no results, " + dns.RcodeToString[msg.Rcode])
 		}
 	} else if msg.Truncated {
-		d.resultsPerNS[ns] = append(d.resultsPerNS[ns], "; ... truncated ...")
+		qr.Add("; ... truncated ...")
 	}
+	// FIXME: prior result?
+	d.resultsPerNS[ns] = qr
 }
 
 func retryJitter(base time.Duration) time.Duration {
