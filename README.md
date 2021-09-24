@@ -103,9 +103,11 @@ file, there exists a symlink in the bin directory.
 
  * `dns_ask_auth`: issue a DNS query to each of the authoritative nameservers
    for the domains of the parameters, asking for the value from each and
-   showing them.  This is useful for consistency checks.  The default qtype is
-   `TXT`, and `SOA` is a useful choice for seeing if the SOA serials are
-   consistent.
+   showing them.  This is useful for consistency checks.
+   + The default qtype is `TXT`, and `SOA` is a useful choice for seeing if
+     the SOA serials are consistent.
+   + DNSKEY records will have derived DS records and various flags added as
+     comments, to aid in glue debugging.
  * `dns_cache_warm`: a way to ask multiple DNS recursors a large number of
    queries in parallel, useful for pre-warming DNS caches.
    + This expects a configuration file, default at
@@ -118,6 +120,14 @@ file, there exists a symlink in the bin directory.
      resolution, a count of resolutions queries done so far will be
      repeatedly updated on one line, before being replaced with the summary
      when done.
+ * `go_grab_topath`: given Go import paths on the command-line, each one is
+    downloaded as a VCS repository into the old `$GOPATH` hierarchy; this
+    roughly matches the pre-modules `go get` behavior, facilitating working on
+    the source of some code instead of fetching a static snapshot to use as a
+    dependency.
+    + This uses the `$GOPATH/src` layout because it's a prior existing
+      convention, not because it's right.  This is demonstration code, adjust
+      to suit local conventions/desires.
 
 I use a wrapper `dns_cache_warm_home` which puts some `.home.arpa` hostnames
 into the `DNS_CACHE_EXTRA_RESOLVE` environment variable and invokes
