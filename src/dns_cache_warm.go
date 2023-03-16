@@ -1,4 +1,4 @@
-// +build exclude_except_for_go_mod
+//go:build exclude_except_for_go_mod
 
 // NEXT SHOULD COME: GRID RESULTS (sanity) (back-channel from per-resolver to admin)
 
@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -457,7 +456,7 @@ func streamFromConfig(fn string) (<-chan Item, error) {
 
 func streamFromString(dataStr string) <-chan Item {
 	ch := make(chan Item)
-	rdr := ioutil.NopCloser(strings.NewReader(dataStr))
+	rdr := io.NopCloser(strings.NewReader(dataStr))
 	go parseConfigBufferToChan(rdr, ch)
 	return ch
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mitchellh/go-homedir"
 	"golang.org/x/tools/go/vcs"
@@ -15,7 +16,17 @@ import (
 
 const EX_USAGE = 64 // per sysexits.h
 
+var opts struct {
+	notReally bool
+}
+
+func registerFlags() {
+	flag.BoolVar(&opts.notReally, "not-really", false, "don't actually clone, just show")
+	flag.BoolVar(&opts.notReally, "n", false, "short for -not-really")
+}
+
 func main() {
+	registerFlags()
 	golib.FastFlags()
 	retval := 0
 	defer func() {
@@ -38,7 +49,7 @@ func main() {
 		return
 	}
 
-	for _, p := range os.Args[1:] {
+	for _, p := range importPaths {
 		if err = download(p, wrGosrc); err != nil {
 			golib.Stderr("grab of %q failed: %s", p, err)
 			if retval == 0 {
@@ -49,6 +60,15 @@ func main() {
 }
 
 func download(importSpec string, wrGosrc string) error {
+	for _, prefix := range []string{
+		"https://",
+		"http://",
+	} {
+		if strings.HasPrefix(importSpec, prefix) {
+			importSpec = importSpec[len(prefix):]
+			break
+		}
+	}
 	repoRoot, err := vcs.RepoRootForImportPath(importSpec, false)
 	if err != nil {
 		return err
@@ -67,11 +87,19 @@ func download(importSpec string, wrGosrc string) error {
 		return fmt.Errorf("target dir %q already exists", targetDir)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(targetDir), 0o755); err != nil {
+	actionMsg := "cloning"
+
+	if opts.notReally {
+		golib.Stderr("would: MkDirAll(%q)", filepath.Dir(targetDir))
+		actionMsg = "would: clone"
+	} else if err := os.MkdirAll(filepath.Dir(targetDir), 0o755); err != nil {
 		return fmt.Errorf("creating parents of %q failed: %w", targetDir, err)
 	}
 
-	golib.Stderr("cloning %s repo from %q to %q", repoRoot.VCS.Name, repoRoot.Repo, targetDir)
+	golib.Stderr("%s %s repo from %q to %q", actionMsg, repoRoot.VCS.Name, repoRoot.Repo, targetDir)
+	if opts.notReally {
+		return nil
+	}
 	return repoRoot.VCS.Create(targetDir, repoRoot.Repo)
 }
 

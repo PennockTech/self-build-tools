@@ -1,9 +1,10 @@
-// +build exclude_except_for_go_mod
+//go:build exclude_except_for_go_mod
 
 package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,9 +16,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/idna"
+	"golang.org/x/net/publicsuffix"
 
 	"example.org/private/selfbuild/golib"
 )
@@ -30,6 +33,17 @@ const DEF_RESOLVERCONF = "/etc/resolv.conf"
 
 var NotAnIPAddress = errors.New("not an IP address")
 
+type DNSServFailErrT struct {
+	ede string
+}
+
+func (e DNSServFailErrT) Error() string {
+	if e.ede == "" {
+		return "DNS SERVFAIL"
+	}
+	return "DNS SERVFAIL [" + e.ede + "]"
+}
+
 var opts struct {
 	resolverConfigFile string
 	qtype              string
@@ -37,28 +51,34 @@ var opts struct {
 	dnsAttempts        uint
 	edns0_size         uint
 	skipLabels         uint
+	askDomainParents   bool
 	ipv4Transport      bool
 	ipv6Transport      bool
 	tcpTransport       bool
 	ipReverse          bool
 	checkPrimary       bool
 	serialMode         bool
+	showRRSIG          bool
+	noNSID             bool
 	addedServers       golib.AccumList
 }
 
 func registerFlags() {
 	flag.StringVar(&opts.qtype, "t", "txt", "DNS query type")
-	flag.StringVar(&opts.resolverConfigFile, "resolvconf", DEF_RESOLVERCONF, "DNS resolver config file") // not currently used for initial seed, only MName, might change that
+	flag.StringVar(&opts.resolverConfigFile, "resolvconf", DEF_RESOLVERCONF, "DNS resolver config file")
 	flag.DurationVar(&opts.timeout, "timeout", DEF_DNS_TIMEOUT, "DNS query timeout")
 	flag.UintVar(&opts.dnsAttempts, "attempts", DEF_DNS_ATTEMPTS, "DNS max attempt count")
 	flag.UintVar(&opts.edns0_size, "size", DEF_EDNS0_SIZE, "EDNS0 size")
 	flag.UintVar(&opts.skipLabels, "skip-labels", 0, "skip N labels before trying to find NS")
+	flag.BoolVar(&opts.askDomainParents, "ask-parents", false, "ask the servers for the public suffix domain")
 	flag.BoolVar(&opts.ipv4Transport, "4", false, "Use IPv4 transport to DNS servers")
 	flag.BoolVar(&opts.ipv6Transport, "6", false, "Use IPv6 transport to DNS servers")
 	flag.BoolVar(&opts.tcpTransport, "tcp", false, "Use TCP transport to DNS servers")
 	flag.BoolVar(&opts.ipReverse, "x", false, "If parameters are IP addresses, reverse into appropriate namespace")
 	flag.BoolVar(&opts.checkPrimary, "primary", false, "Query to the SOA MNAME server too")
 	flag.BoolVar(&opts.serialMode, "serial-mode", false, "Tune output for SOA Serial query mode")
+	flag.BoolVar(&opts.showRRSIG, "show-rrsig", false, "Don't elide RRSIG RRs when showing response")
+	flag.BoolVar(&opts.noNSID, "no-nsid", false, "Don't ask for NSID (in case of server bugs)")
 	opts.addedServers.Validator = isIpAddress
 	opts.addedServers.ResetOnDash = true
 	flag.Var(&opts.addedServers, "servers", "Add to server list (or - to reset)")
@@ -140,6 +160,7 @@ func main() {
 
 type QueryResult struct {
 	Strings     []string
+	NSID        string
 	DurationQ   time.Duration
 	DurationAll time.Duration
 }
@@ -307,7 +328,11 @@ func (d *Domain) ShowEach(out io.Writer) {
 		if ok && qr == nil {
 			fmt.Fprintf(out, "; NAMESERVER: %q no results struct, internal bug?\n", ns)
 		} else if ok {
-			fmt.Fprintf(out, "; NAMESERVER: %q [%v/%v]\n", ns, qr.DurationQ.Round(time.Millisecond), qr.DurationAll.Round(time.Millisecond))
+			if opts.noNSID {
+				fmt.Fprintf(out, "; NAMESERVER: %q [%v/%v]\n", ns, qr.DurationQ.Round(time.Millisecond), qr.DurationAll.Round(time.Millisecond))
+			} else {
+				fmt.Fprintf(out, "; NAMESERVER: %q (id: %q) [%v/%v]\n", ns, qr.NSID, qr.DurationQ.Round(time.Millisecond), qr.DurationAll.Round(time.Millisecond))
+			}
 			for _, msg := range qr.Strings {
 				fmt.Fprintf(out, "%s\n", msg)
 			}
@@ -326,10 +351,9 @@ func (d *Domain) Failed() bool {
 }
 
 func (d *Domain) findAuthNS() {
-	res := &net.Resolver{}
 	var (
-		nsList          []*net.NS
-		err             error
+		nsList          NSList
+		err, err2       error
 		offset          int
 		end             bool
 		skipped         uint
@@ -337,6 +361,7 @@ func (d *Domain) findAuthNS() {
 		foundPrimary    string
 		startTime       time.Time
 		resDuration     time.Duration
+		registeredDom   string
 	)
 	qname := d.name
 	if opts.addedServers.WasReset {
@@ -344,6 +369,18 @@ func (d *Domain) findAuthNS() {
 	}
 	startTime = time.Now()
 	for len(qname) > 0 {
+
+		// This is equivalent to an auto-derived skipLabels; we put it first so
+		// that the two can be used together, in case there's a multi-level
+		// public suffix domain (other than TLD).
+		if opts.askDomainParents {
+			t, _ := publicsuffix.PublicSuffix(qname[:len(qname)-1])
+			if t == "" {
+				d.errors = append(d.errors, fmt.Errorf("failed to find public suffix of %q", qname))
+				break
+			}
+			qname = t + "."
+		}
 
 		// This helps with wanting to query NS type at parent, for glue
 		if opts.skipLabels > 0 {
@@ -361,17 +398,34 @@ func (d *Domain) findAuthNS() {
 
 		// This diagnostic, uncommented, shows the NextLabel splitting working:
 		//d.info = append(d.info, fmt.Sprintf("querying for NS of: %q", qname))
-		nsList, err = res.LookupNS(d.ctx, qname)
+		nsList, err = LookupNS(d.ctx, qname)
 		if err == nil {
 			resDuration = time.Since(startTime).Round(time.Millisecond)
 			suf := "s"
-			l := len(nsList)
+			l := nsList.Length()
 			if l == 1 {
 				suf = ""
 			}
 			d.info = append(d.info, fmt.Sprintf("found %d NS record%s for %q in %s", l, suf, qname, resDuration))
 			break
+		} else if servFail, ok := err.(DNSServFailErrT); ok {
+			if registeredDom == "" {
+				registeredDom, err2 = publicsuffix.EffectiveTLDPlusOne(qname[:len(qname)-1]) // get empty result if trailing dot included
+				if err2 != nil {
+					d.errors = append(d.errors, fmt.Errorf("unable to derive publicsuffix-based domain of %q: %w", qname, err2))
+				} else {
+					registeredDom += "."
+				}
+			}
+			// We've sanitized to lower-case, I think the PSL stuff will always be lower-case
+			if qname == registeredDom {
+				d.errors = append(d.errors, fmt.Errorf("%s on public-registered domain %q, not asking TLDish servers", servFail, qname))
+				return
+			} else {
+				d.info = append(d.info, fmt.Sprintf("lookup %q NS got %s, something is broken (on their side?)", qname, servFail))
+			}
 		}
+
 		// dns.NextLabel handles backslash escapes
 		offset, end = dns.NextLabel(d.name, offset)
 		if end {
@@ -393,12 +447,12 @@ func (d *Domain) findAuthNS() {
 			}
 		}
 	}
-	d.authNS = make([]string, len(nsList)+len(opts.addedServers.L)+primaryCapacity)
-	for i := range nsList {
-		d.authNS[i] = nsList[i].Host
+	d.authNS = make([]string, nsList.Length()+len(opts.addedServers.L)+primaryCapacity)
+	for i := 0; i < nsList.Length(); i++ {
+		d.authNS[i] = nsList.HostAt(i)
 	}
 	if len(opts.addedServers.L) > 0 {
-		base := len(nsList)
+		base := nsList.Length()
 		for i := range opts.addedServers.L {
 			d.authNS[base+i] = opts.addedServers.L[i]
 		}
@@ -412,7 +466,7 @@ func (d *Domain) findAuthNS() {
 		}
 		if primaryCapacity > 0 {
 			d.info = append(d.info, fmt.Sprintf("found distinct SOA MName for %q", qname))
-			d.authNS[len(nsList)+len(opts.addedServers.L)] = foundPrimary
+			d.authNS[nsList.Length()+len(opts.addedServers.L)] = foundPrimary
 		} else {
 			// Slice [x:y] is x thru y-1 inclusive, so :len(slice) gets the
 			// entire thing; so if the primary is already present we're
@@ -424,16 +478,42 @@ func (d *Domain) findAuthNS() {
 	}
 }
 
+type NSList struct {
+	hosts []string
+}
+
+func (nl NSList) Length() int             { return len(nl.hosts) }
+func (nl NSList) HostAt(index int) string { return nl.hosts[index] }
+
+func LookupNS(ctx context.Context, name string) (NSList, error) {
+	nsResults, err := recursiveResolve(ctx, name, dns.TypeNS)
+	if err != nil {
+		return NSList{}, err
+	}
+	if len(nsResults) == 0 {
+		return NSList{}, errors.New("no NS results")
+	}
+	hosts := make([]string, len(nsResults))
+	for i := range nsResults {
+		ns, ok := nsResults[i].(*dns.NS)
+		if !ok {
+			panic("programming bug: non-NS result returned from recursiveResolve")
+		}
+		hosts[i] = ns.Ns
+	}
+	return NSList{hosts: hosts}, nil
+}
+
 func recursiveResolve(ctx context.Context, qDomain string, qType uint16) ([]dns.RR, error) {
 	// This is currently naive and does not handle fallback to secondary resolvers with decent concurrency.
 	client := dns.Client{
 		Timeout: opts.timeout,
 		Net:     networkPerOptions(),
 	}
-	m := dns.Msg{}
-	m.SetQuestion(qDomain, dns.TypeSOA)
-	m.SetEdns0(uint16(opts.edns0_size), false)
+	m := &dns.Msg{}
 	m.RecursionDesired = true
+	m = m.SetQuestion(qDomain, qType)
+	m = m.SetEdns0(uint16(opts.edns0_size), true)
 	var (
 		cfg         *dns.ClientConfig
 		err         error
@@ -444,7 +524,7 @@ func recursiveResolve(ctx context.Context, qDomain string, qType uint16) ([]dns.
 		serverIndex int
 		server      string
 	)
-	cfg, err = dns.ClientConfigFromFile(opts.resolverConfigFile)
+	cfg, err = loadDNSClientConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -454,7 +534,7 @@ func recursiveResolve(ctx context.Context, qDomain string, qType uint16) ([]dns.
 		}
 		// TODO: implement concurrency and raise serverIndex (% len(cfg.Servers))
 		server = cfg.Servers[serverIndex] + ":" + cfg.Port
-		msg, _, err = client.ExchangeContext(ctx, &m, server)
+		msg, _, err = client.ExchangeContext(ctx, m, server)
 		if err != nil {
 			if i == 0 {
 				firstError = err
@@ -467,6 +547,12 @@ func recursiveResolve(ctx context.Context, qDomain string, qType uint16) ([]dns.
 	}
 	if err != nil {
 		return nil, firstError
+	}
+	if msg.Rcode == dns.RcodeServerFailure {
+		if ede, ok := extractExtendedError(msg); ok {
+			return nil, DNSServFailErrT{ede: ede}
+		}
+		return nil, DNSServFailErrT{}
 	}
 	sought := make([]dns.RR, 0, len(msg.Answer))
 	for i := range msg.Answer {
@@ -496,10 +582,22 @@ func (d *Domain) queryOneNS(ns string) {
 		Timeout: opts.timeout,
 		Net:     networkPerOptions(),
 	}
-	m := dns.Msg{}
-	m.SetQuestion(d.name, d.qtype)
-	m.SetEdns0(uint16(opts.edns0_size), false)
-	m.RecursionDesired = false
+	m := &dns.Msg{}
+	m = m.SetQuestion(d.name, d.qtype)
+	if opts.noNSID {
+		m = m.SetEdns0(uint16(opts.edns0_size), true)
+	} else {
+		// See .SetEdns0 implementation
+		o := new(dns.OPT)
+		o.Hdr.Name = "."
+		o.Hdr.Rrtype = dns.TypeOPT
+		o.SetUDPSize(uint16(opts.edns0_size))
+		o.SetDo()
+		oNSID := new(dns.EDNS0_NSID)
+		oNSID.Code = dns.EDNS0NSID
+		o.Option = append(o.Option, oNSID)
+		m.Extra = append(m.Extra, o)
+	}
 	var (
 		err        error
 		firstError error
@@ -516,7 +614,7 @@ func (d *Domain) queryOneNS(ns string) {
 			time.Sleep(retryJitter((2 << (i - 1)) * time.Second))
 		}
 		thisStart = time.Now()
-		msg, _, err = client.ExchangeContext(d.ctx, &m, ns+":53")
+		msg, _, err = client.ExchangeContext(d.ctx, m, ns+":53")
 		qr.DurationQ = time.Since(thisStart)
 		if err != nil {
 			if i == 0 {
@@ -540,7 +638,8 @@ func (d *Domain) queryOneNS(ns string) {
 	for i := range msg.Answer {
 		suffix := ""
 		if h := msg.Answer[i].Header(); h != nil {
-			if h.Rrtype == dns.TypeDNSKEY {
+			switch h.Rrtype {
+			case dns.TypeDNSKEY:
 				dk := msg.Answer[i].(*dns.DNSKEY)
 				suffix += "\t;"
 				if dk.Flags&dns.SEP != 0 {
@@ -554,7 +653,11 @@ func (d *Domain) queryOneNS(ns string) {
 				}
 				ds := dk.ToDS(dns.SHA256)
 				suffix += fmt.Sprintf(" | DS keytag=%d alg=%d digesttype=%d digest=%s",
-					ds.KeyTag, ds.Algorithm, ds.DigestType, ds.Digest)
+					ds.KeyTag, ds.Algorithm, ds.DigestType, strings.ToUpper(ds.Digest))
+			case dns.TypeRRSIG:
+				if !opts.showRRSIG {
+					continue
+				}
 			}
 		}
 		qr.Add(msg.Answer[i].String() + suffix)
@@ -564,10 +667,45 @@ func (d *Domain) queryOneNS(ns string) {
 			d.errorsPerNS[ns] = append(d.errorsPerNS[ns], fmt.Errorf("truncated: %s", ns))
 		} else {
 			qr.Add("; no results, " + dns.RcodeToString[msg.Rcode])
+			if ede, ok := extractExtendedError(msg); ok {
+				qr.Add("; extended error: " + ede)
+			}
 		}
 	} else if msg.Truncated {
 		qr.Add("; ... truncated ...")
 	}
+
+	if d.qtype == dns.TypeNS && len(msg.Answer) == 0 && len(msg.Ns) > 0 {
+		// We will return glue of NS from authority section
+		// Note that DS records are authoritative in parent so should have been in the answer section.
+		qr.Add("; from the Authority/NS section:")
+		for i := range msg.Ns {
+			h := msg.Ns[i].Header()
+			if h == nil {
+				continue
+			}
+			if h.Rrtype != dns.TypeNS {
+				continue
+			}
+			qr.Add(msg.Ns[i].String())
+		}
+	}
+
+	if !opts.noNSID {
+		responseOpts := extractOpt(msg)
+		if responseOpts != nil {
+			for _, o := range responseOpts.Option {
+				switch realO := o.(type) {
+				case *dns.EDNS0_NSID:
+					// RFC 5001 insist that you must always use hex.
+					// So the DNS lib has helpfully converted to hex for us.
+					// Yet normally, there's a convenient human string in there.
+					qr.NSID = nsidRender(realO)
+				}
+			}
+		}
+	}
+
 	// FIXME: prior result?
 	d.resultsPerNS[ns] = qr
 }
@@ -603,4 +741,69 @@ func isIpAddress(candidate string) error {
 		return NotAnIPAddress
 	}
 	return nil
+}
+
+var (
+	loadedResolverCfg *dns.ClientConfig
+	loadedResolverErr error
+	loadResolverOnce  sync.Once
+)
+
+func loadDNSClientConfig() (*dns.ClientConfig, error) {
+	loadResolverOnce.Do(func() {
+		loadedResolverCfg, loadedResolverErr = dns.ClientConfigFromFile(opts.resolverConfigFile)
+	})
+	return loadedResolverCfg, loadedResolverErr
+}
+
+func extractOpt(msg *dns.Msg) (opt *dns.OPT) {
+	if len(msg.Extra) == 0 {
+		return nil
+	}
+	last := msg.Extra[len(msg.Extra)-1]
+	if last.Header().Rrtype != dns.TypeTSIG && len(msg.Extra) >= 2 {
+		last = msg.Extra[len(msg.Extra)-2]
+	}
+	if last.Header().Rrtype != dns.TypeOPT {
+		return nil
+	}
+	opt, ok := last.(*dns.OPT)
+	if !ok {
+		panic("rr of type OPT does not typecast to dns.Opt")
+	}
+	return opt
+}
+
+func extractExtendedError(msg *dns.Msg) (ede string, ok bool) {
+	opt := extractOpt(msg)
+	if opt == nil {
+		return "", false
+	}
+	for _, o := range opt.Option {
+		switch o.(type) {
+		case *dns.EDNS0_EDE:
+			return o.String(), true
+		}
+	}
+	return "", false
+}
+
+func nsidRender(opt *dns.EDNS0_NSID) string {
+	// The RFC 5001 approach: return opt.String()
+	// So, we're going to have to hex-decode the freshly hex-encoded string for us, because the dns lib hides the raw bytes
+	h, err := hex.DecodeString(opt.Nsid)
+	if err != nil {
+		return opt.String() + "<" + err.Error() + ">"
+	}
+	safe := true
+	for i := range h {
+		if h[i] >= 0x7F || !unicode.IsPrint(rune(h[i])) {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return string(h)
+	}
+	return opt.Nsid
 }
